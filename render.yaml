@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: onlineradio
+    env: docker
+    plan: free
+    region: oregon
+    healthCheckPath: /healthz
+    envVars:
+      - key: STATION_NAME
+        value: My Online Radio
+      - key: SOURCE_PASSWORD
+        value: myradiopassword

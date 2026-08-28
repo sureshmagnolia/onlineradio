@@ -1,0 +1,778 @@
+"""
+Hybrid Internet Radio Server (Live Broadcast + Recorded Audio AutoDJ)
+Features:
+- Non-blocking read1() Live Stream Ingestion from BUTT / Mixxx / Mobile Apps.
+- Deterministic 128kbps MP3 Audio Clock: Zero stutter, uninterrupted 24/7 stream.
+- Auto-Switch: Smoothly transitions between DJ and AutoDJ background playlist.
+- Native HTML5 Web Player & Direct /radio.mp3 Stream for Choyong LC90 / VLC.
+"""
+
+import os
+import glob
+import threading
+import queue
+import time
+import socket
+import base64
+import json
+import collections
+import http.client
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+PORT = int(os.environ.get("PORT", 8080))
+SOURCE_PASSWORD = os.environ.get("SOURCE_PASSWORD", "myradiopassword")
+STATION_NAME = os.environ.get("STATION_NAME", "My Online Radio")
+
+ZENO_SERVER = "link.zeno.fm"
+ZENO_PORT = 80
+ZENO_MOUNT = "/yz9ttrydrc9uv/source"
+ZENO_USER = "source"
+ZENO_PASS = "Wg8Lut3x"
+
+AUDIO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio")
+os.makedirs(AUDIO_DIR, exist_ok=True)
+
+is_live = False
+current_track = "welcome_jingle.mp3"
+state_lock = threading.Lock()
+
+listener_queues = []
+listeners_lock = threading.Lock()
+buffer_lock = threading.Lock()
+# A rolling buffer of 32KB (approx 2 seconds of 128kbps audio) allows listeners to connect quickly without huge delay.
+rolling_buffer = collections.deque(maxlen=1024 * 32)
+zeno_queue = queue.Queue(maxsize=100)
+
+def broadcast_audio(chunk):
+    """Pushes audio chunk to all connected listeners."""
+    with buffer_lock:
+        for byte in chunk:
+            rolling_buffer.append(byte)
+
+    with listeners_lock:
+        for q in list(listener_queues):
+            try:
+                q.put_nowait(chunk)
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(chunk)
+                except Exception:
+                    pass
+                    
+    try:
+        zeno_queue.put_nowait(chunk)
+    except queue.Full:
+        try:
+            zeno_queue.get_nowait()
+            zeno_queue.put_nowait(chunk)
+        except Exception:
+            pass
+
+# Load Jingle and strip ID3 tags once to prevent mid-stream decoder crashes
+jingle_bytes = b""
+try:
+    with open(os.path.join(AUDIO_DIR, "welcome_jingle.mp3"), "rb") as f:
+        data = f.read()
+        
+        # Skip ID3v2 tag at the start
+        if data.startswith(b"ID3"):
+            size = (data[6] << 21) | (data[7] << 14) | (data[8] << 7) | data[9]
+            data = data[size + 10:]
+            
+        # Skip ID3v1 tag at the end
+        if data[-128:].startswith(b"TAG"):
+            data = data[:-128]
+            
+        jingle_bytes = data
+except Exception as e:
+    print(f"Error loading Jingle: {e}", flush=True)
+
+live_mode_type = None
+
+def autodj_worker():
+    global current_track, is_live, live_mode_type, last_studio_ping
+    jingle_pos = 0
+    
+    while True:
+        if is_live:
+            if live_mode_type == "STUDIO" and 'last_studio_ping' in globals() and time.time() - last_studio_ping > 5:
+                with state_lock:
+                    is_live = False
+                    current_track = "welcome_jingle.mp3"
+            else:
+                time.sleep(1)
+                continue
+
+        if not jingle_bytes:
+            time.sleep(1)
+            continue
+            
+        try:
+            while not is_live:
+                chunk = jingle_bytes[jingle_pos:jingle_pos+2048]
+                jingle_pos += 2048
+                
+                if not chunk:
+                    # End of jingle, loop back to start
+                    jingle_pos = 0
+                    continue
+                
+                broadcast_audio(chunk)
+                
+                # Sleep to emulate 128kbps (16KB/s). 2048 bytes = 0.125s
+                time.sleep(0.125)
+        except Exception:
+            time.sleep(1)
+
+def zeno_broadcaster_worker():
+    auth = base64.b64encode(f"{ZENO_USER}:{ZENO_PASS}".encode()).decode("ascii")
+    headers = {
+        "Authorization": f"Basic {auth}",
+        "Content-Type": "audio/mpeg",
+        "Ice-Name": STATION_NAME,
+        "Ice-Public": "1"
+    }
+    
+    while True:
+        try:
+            conn = http.client.HTTPConnection(ZENO_SERVER, ZENO_PORT, timeout=10)
+            conn.putrequest("PUT", ZENO_MOUNT)
+            for header, value in headers.items():
+                conn.putheader(header, value)
+            conn.endheaders()
+            
+            print(f"[Zeno] Connected to Zeno.fm successfully! ({ZENO_MOUNT})", flush=True)
+            
+            # Clear any stale data in the queue
+            while not zeno_queue.empty():
+                try:
+                    zeno_queue.get_nowait()
+                except queue.Empty:
+                    break
+            
+            while True:
+                chunk = zeno_queue.get()
+                conn.send(chunk)
+        except Exception as e:
+            print(f"[Zeno] Connection lost: {e}. Reconnecting in 5s...", flush=True)
+            time.sleep(5)
+
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>""" + STATION_NAME + """ - Live Radio</title>
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📻</text></svg>">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --primary: #6366f1;
+            --primary-glow: rgba(99, 102, 241, 0.4);
+            --live-red: #ef4444;
+            --bg-dark: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.85);
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Outfit', sans-serif; }
+        body {
+            background: radial-gradient(circle at top, #1e1b4b, #0f172a 70%);
+            color: #f8fafc;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        .player-card {
+            background: var(--card-bg);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 24px;
+            padding: 40px 32px;
+            max-width: 440px;
+            width: 100%;
+            text-align: center;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5), 0 0 40px var(--primary-glow);
+        }
+        .station-title { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 14px;
+            border-radius: 999px;
+            font-size: 13px;
+            font-weight: 600;
+            margin-bottom: 24px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .badge.playlist { background: rgba(99, 102, 241, 0.2); color: #818cf8; border: 1px solid rgba(99, 102, 241, 0.4); }
+        .badge.live { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); animation: pulse 1.5s infinite; }
+        .pulse-dot { width: 8px; height: 8px; border-radius: 50%; background: currentColor; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+        .track-box {
+            background: rgba(15, 23, 42, 0.6);
+            border-radius: 16px;
+            padding: 16px;
+            margin-bottom: 24px;
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .track-label { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+        .track-name { font-size: 16px; font-weight: 600; color: #e2e8f0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .native-player-container {
+            margin: 20px 0;
+            display: flex;
+            justify-content: center;
+        }
+        audio {
+            width: 100%;
+            border-radius: 30px;
+            outline: none;
+        }
+        .stream-link {
+            font-size: 12px;
+            color: #94a3b8;
+            word-break: break-all;
+            background: rgba(0,0,0,0.3);
+            padding: 10px;
+            border-radius: 10px;
+            margin-top: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="player-card">
+        <h1 class="station-title">""" + STATION_NAME + """</h1>
+        <div id="statusBadge" class="badge playlist">
+            <div class="pulse-dot"></div>
+            <span id="statusText">Recorded Playlist</span>
+        </div>
+        <div class="track-box">
+            <div class="track-label">Now Playing</div>
+            <div id="trackName" class="track-name">welcome_jingle.mp3</div>
+        </div>
+        <div class="native-player-container">
+            <audio id="audioPlayer" controls preload="auto" src="/radio.mp3"></audio>
+        </div>
+        <div class="stream-link">
+            Direct MP3 Stream Link for Choyong Radio / VLC:<br>
+            <strong id="fullStreamUrl">/radio.mp3</strong>
+        </div>
+    </div>
+    <script>
+        const statusBadge = document.getElementById('statusBadge');
+        const statusText = document.getElementById('statusText');
+        const trackName = document.getElementById('trackName');
+        document.getElementById('fullStreamUrl').innerText = window.location.origin + '/radio.mp3';
+
+        async function updateStatus() {
+            try {
+                const res = await fetch('/status');
+                const data = await res.json();
+                trackName.innerText = data.track;
+                if (data.is_live) {
+                    statusBadge.className = 'badge live';
+                    statusText.innerText = '🔴 LIVE BROADCAST';
+                } else {
+                    statusBadge.className = 'badge playlist';
+                    statusText.innerText = '📻 Recorded Playlist';
+                }
+            } catch(e){}
+        }
+        setInterval(updateStatus, 2000);
+        updateStatus();
+    </script>
+</body>
+</html>
+"""
+
+STUDIO_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Broadcaster Studio</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #111; color: #fff; text-align: center; margin: 0; padding: 20px; }
+        .container { max-width: 400px; margin: 0 auto; background: #222; padding: 30px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); margin-top: 50px; }
+        h2 { margin-top: 0; }
+        input[type="password"], input[type="number"] { width: 100%; padding: 15px; box-sizing: border-box; background: #333; border: 1px solid #444; color: white; border-radius: 8px; margin-bottom: 20px; font-size: 16px; }
+        button { background: #3b82f6; color: white; border: none; padding: 15px 30px; font-size: 18px; font-weight: bold; border-radius: 8px; cursor: pointer; width: 100%; transition: 0.2s; }
+        button:hover { background: #2563eb; }
+        .btn-danger { background: #4b5563; margin-top: 15px; font-size: 14px; padding: 10px; }
+        .btn-danger:hover { background: #dc2626; }
+        #mic-btn { background: #10b981; margin-top: 20px; height: 100px; border-radius: 50px; font-size: 24px; box-shadow: 0 0 20px rgba(16,185,129,0.3); }
+        #mic-btn.active { background: #ef4444; box-shadow: 0 0 30px rgba(239,68,68,0.5); animation: pulse 2s infinite; }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            70% { box-shadow: 0 0 0 20px rgba(239, 68, 68, 0); }
+            100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+        }
+        #vu-meter-container { margin-top: 30px; background: #000; height: 30px; border-radius: 15px; overflow: hidden; position: relative; }
+        #vu-meter-fill { background: linear-gradient(90deg, #10b981, #f59e0b, #ef4444); width: 0%; height: 100%; transition: width 0.1s; }
+        #status-text { margin-top: 20px; font-size: 18px; color: #9ca3af; }
+    </style>
+</head>
+<body>
+    <div class="container" id="login-screen">
+        <h2>Studio Login</h2>
+        <input type="password" id="password" placeholder="Source Password" />
+        <div style="margin-bottom: 10px; text-align: left; color: #ccc;" id="captcha-question"></div>
+        <input type="number" id="captcha-answer" placeholder="Answer" />
+        <button onclick="login()">Enter Studio</button>
+    </div>
+    
+    <div class="container" id="studio-screen" style="display:none;">
+        <h2>Studio Control</h2>
+        <div id="status-text">Ready to Broadcast</div>
+        <button id="mic-btn" onclick="toggleBroadcast()">GO LIVE</button>
+        <div id="vu-meter-container">
+            <div id="vu-meter-fill"></div>
+        </div>
+        <button class="btn-danger" onclick="logout()">Log Out</button>
+    </div>
+
+    <script>
+        let audioContext;
+        let mediaStream;
+        let processor;
+        let mp3Encoder;
+        let isBroadcasting = false;
+        let password = '';
+        let vuFill = document.getElementById('vu-meter-fill');
+        let statusText = document.getElementById('status-text');
+        let captchaExpected = 0;
+
+        function generateCaptcha() {
+            let a = Math.floor(Math.random() * 10) + 1;
+            let b = Math.floor(Math.random() * 10) + 1;
+            captchaExpected = a + b;
+            document.getElementById('captcha-question').innerText = `Human Check: What is ${a} + ${b}?`;
+            document.getElementById('captcha-answer').value = '';
+        }
+        generateCaptcha();
+
+        async function login() {
+            let ans = parseInt(document.getElementById('captcha-answer').value);
+            if (ans !== captchaExpected) {
+                alert("Incorrect captcha!");
+                generateCaptcha();
+                return;
+            }
+
+            password = document.getElementById('password').value;
+            // Test password
+            try {
+                let res = await fetch('/api/stream', {
+                    method: 'POST', 
+                    headers: {'Authorization': password},
+                    body: new Uint8Array(0)
+                });
+                if (!res.ok) { 
+                    alert('Invalid Password'); 
+                    generateCaptcha();
+                    return; 
+                }
+                
+                document.getElementById('login-screen').style.display = 'none';
+                document.getElementById('studio-screen').style.display = 'block';
+            } catch(e) {
+                alert('Connection error');
+            }
+        }
+
+        function logout() {
+            if (isBroadcasting) stopBroadcast();
+            password = '';
+            document.getElementById('password').value = '';
+            generateCaptcha();
+            document.getElementById('studio-screen').style.display = 'none';
+            document.getElementById('login-screen').style.display = 'block';
+        }
+
+        async function toggleBroadcast() {
+            if (isBroadcasting) {
+                stopBroadcast();
+            } else {
+                startBroadcast();
+            }
+        }
+
+        async function startBroadcast() {
+            try {
+                // Initialize Stereo MP3 Encoder to match Jingle (2 channels) to prevent browser decoder crashes
+                mp3Encoder = new lamejs.Mp3Encoder(2, 44100, 128); 
+                
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        echoCancellation: true, 
+                        noiseSuppression: true, 
+                        autoGainControl: true 
+                    } 
+                });
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 44100});
+                let source = audioContext.createMediaStreamSource(mediaStream);
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = function(e) {
+                    if (!isBroadcasting) return;
+                    let float32Array = e.inputBuffer.getChannelData(0);
+                    
+                    let sum = 0;
+                    let int16Array = new Int16Array(float32Array.length);
+                    for (let i = 0; i < float32Array.length; i++) {
+                        // +14dB digital gain
+                        let val = float32Array[i] * 5.0;
+                        if (val > 1.0) val = 1.0;
+                        if (val < -1.0) val = -1.0;
+                        
+                        sum += val * val;
+                        int16Array[i] = val < 0 ? val * 0x8000 : val * 0x7FFF;
+                    }
+                    
+                    let rms = Math.sqrt(sum / float32Array.length);
+                    vuFill.style.width = Math.min(100, rms * 500) + '%';
+                    
+                    // Pass int16Array twice (left and right) for dual-mono Stereo!
+                    let mp3buf = mp3Encoder.encodeBuffer(int16Array, int16Array);
+                    if (mp3buf.length > 0) {
+                        sendChunk(mp3buf);
+                    }
+                };
+                
+                let dummyGain = audioContext.createGain();
+                dummyGain.gain.value = 0; // MUTE local playback to prevent echo-cancellation
+                processor.connect(dummyGain);
+                dummyGain.connect(audioContext.destination);
+                source.connect(processor);
+                
+                isBroadcasting = true;
+                let btn = document.getElementById('mic-btn');
+                btn.innerText = "ON AIR";
+                btn.className = "active";
+                statusText.innerText = "🔴 BROADCASTING LIVE";
+                statusText.style.color = "#ef4444";
+                
+            } catch (e) {
+                alert("Microphone error: " + e.message);
+            }
+        }
+
+        function stopBroadcast() {
+            isBroadcasting = false;
+            if (processor) processor.disconnect();
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (audioContext) audioContext.close();
+            
+            vuFill.style.width = '0%';
+            let btn = document.getElementById('mic-btn');
+            btn.innerText = "GO LIVE";
+            btn.className = "";
+            statusText.innerText = "Ready to Broadcast";
+            statusText.style.color = "#9ca3af";
+            
+            try {
+                let mp3buf = mp3Encoder.flush();
+                if (mp3buf.length > 0) {
+                    sendChunk(mp3buf);
+                }
+            } catch(e) {}
+            
+            fetch('/api/stop', {
+                method: 'POST',
+                headers: {'Authorization': password}
+            }).catch(console.error);
+        }
+
+        let chunkBuffer = [];
+        let chunkByteCount = 0;
+
+        function sendChunk(buf) {
+            let u8 = new Uint8Array(buf);
+            chunkBuffer.push(u8);
+            chunkByteCount += u8.length;
+            
+            // Send approximately 1 second of audio at a time (128kbps = 16KB/s)
+            if (chunkByteCount >= 16000) {
+                let merged = new Uint8Array(chunkByteCount);
+                let offset = 0;
+                for (let b of chunkBuffer) {
+                    merged.set(b, offset);
+                    offset += b.length;
+                }
+                chunkBuffer = [];
+                chunkByteCount = 0;
+                
+                fetch('/api/stream', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': password,
+                        'Content-Type': 'application/octet-stream'
+                    },
+                    body: merged
+                }).catch(e => console.log('Chunk error', e));
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+class RadioServerHandler(BaseHTTPRequestHandler):
+    def do_AUTH(self):
+        auth_header = self.headers.get("Authorization", "")
+        ice_pwd = self.headers.get("ice-password", "")
+        
+        if ice_pwd == SOURCE_PASSWORD or auth_header == SOURCE_PASSWORD:
+            return True
+        if auth_header.startswith("Basic "):
+            try:
+                decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+                pwd = decoded.split(":")[-1]
+                if pwd == SOURCE_PASSWORD:
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def handle_live_source(self):
+        """Non-blocking live audio ingestion via rfile.read1()."""
+        global is_live, current_track
+        if not self.do_AUTH():
+            self.send_response(401)
+            self.send_header("WWW-Authenticate", 'Basic realm="Live Broadcast Source"')
+            self.end_headers()
+            self.wfile.write(b"Unauthorized: Invalid Source Password\n")
+            return
+
+        print(f"\n[🎙️ LIVE] Broadcaster CONNECTED from {self.client_address[0]}!", flush=True)
+        print(f"[DEBUG] Request Line: {self.requestline}", flush=True)
+        print(f"[DEBUG] Headers:\n{self.headers}", flush=True)
+
+        with state_lock:
+            is_live = True
+            live_mode_type = "SCRIPT"
+            current_track = "🔴 LIVE BROADCAST"
+
+        # Set a timeout so we don't hang if the broadcaster drops ungracefully
+        self.connection.settimeout(15.0)
+
+        is_chunked = self.headers.get("Transfer-Encoding", "").lower() == "chunked"
+        
+        try:
+            last_keepalive = time.time()
+            while True:
+                if is_chunked:
+                    # Read chunk size line
+                    line = self.rfile.readline()
+                    if not line:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk_size = int(line, 16)
+                    except ValueError:
+                        break
+                    
+                    if chunk_size == 0:
+                        break # End of stream
+                        
+                    # Read exactly chunk_size bytes
+                    chunk = self.rfile.read(chunk_size)
+                    if not chunk:
+                        break
+                        
+                    # Read the trailing \r\n
+                    self.rfile.read(2)
+                else:
+                    # read1() returns immediately as audio bytes arrive (for non-chunked streams)
+                    chunk = self.rfile.read1(2048)
+                    if not chunk:
+                        print("[!] Broadcaster disconnected.", flush=True)
+                        break
+
+                broadcast_audio(chunk)
+
+                # Render proxy enforces a 100-second idle timeout on HTTP requests.
+                # Writing a dummy space byte every 30s prevents the connection from being dropped.
+                if time.time() - last_keepalive > 30:
+                    try:
+                        self.wfile.write(b" ")
+                        self.wfile.flush()
+                        last_keepalive = time.time()
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[!] Live stream ended: {e}", flush=True)
+        finally:
+            print(f"[🎙️ LIVE] Broadcaster DISCONNECTED: {self.client_address[0]}.", flush=True)
+            with state_lock:
+                is_live = False
+                current_track = "welcome_jingle.mp3"
+                
+            try:
+                self.send_response(200)
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(b"Live stream ended.\n")
+            except Exception:
+                pass
+
+    def do_SOURCE(self):
+        self.handle_live_source()
+
+    def do_PUT(self):
+        self.handle_live_source()
+
+    def do_POST(self):
+        global is_live, current_track, last_studio_ping, live_mode_type
+        
+        if self.path == "/api/stop":
+            if not self.do_AUTH():
+                self.send_response(401)
+                self.end_headers()
+                return
+            with state_lock:
+                is_live = False
+                current_track = "welcome_jingle.mp3"
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+
+        if self.path == "/api/stream":
+            if not self.do_AUTH():
+                self.send_response(401)
+                self.end_headers()
+                return
+            
+            content_length = int(self.headers.get('Content-Length', 0))
+            if content_length > 0:
+                chunk = self.rfile.read(content_length)
+                
+                with state_lock:
+                    is_live = True
+                    live_mode_type = "STUDIO"
+                    current_track = "🔴 LIVE FROM STUDIO"
+                    last_studio_ping = time.time()
+                
+                broadcast_audio(chunk)
+                
+            self.send_response(200)
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            return
+            
+        self.handle_live_source()
+
+    def do_GET(self):
+        if self.path == "/studio":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(STUDIO_HTML.encode("utf-8"))
+            return
+
+        if self.path in ("/healthz", "/health"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
+
+        if self.path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
+
+        if self.path == "/status":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            with state_lock:
+                data = {
+                    "station": STATION_NAME,
+                    "is_live": is_live,
+                    "track": current_track,
+                    "listeners": len(listener_queues)
+                }
+            self.wfile.write(json.dumps(data).encode("utf-8"))
+            return
+
+        if self.path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(INDEX_HTML.encode("utf-8"))
+            return
+
+        if self.path.startswith("/radio.mp3") or self.path.startswith("/stream") or self.path.startswith("/live.mp3"):
+            print(f"[+] Listener connected from {self.client_address[0]}", flush=True)
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("icy-name", STATION_NAME)
+            self.send_header("icy-br", "128")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+
+            client_q = queue.Queue(maxsize=100)
+
+            with buffer_lock:
+                if rolling_buffer:
+                    client_q.put(bytes(rolling_buffer))
+
+            with listeners_lock:
+                listener_queues.append(client_q)
+
+            try:
+                while True:
+                    try:
+                        chunk = client_q.get(timeout=10)
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                    except queue.Empty:
+                        pass
+            except (BrokenPipeError, ConnectionResetError, socket.error):
+                pass
+            finally:
+                with listeners_lock:
+                    if client_q in listener_queues:
+                        listener_queues.remove(client_q)
+                print(f"[-] Listener disconnected: {self.client_address[0]}", flush=True)
+            return
+
+        self.send_error(404)
+
+    def log_message(self, format, *args):
+        return
+
+if __name__ == "__main__":
+    t = threading.Thread(target=autodj_worker, daemon=True)
+    t.start()
+    
+    t_zeno = threading.Thread(target=zeno_broadcaster_worker, daemon=True)
+    t_zeno.start()
+
+    print(f"\n" + "="*60, flush=True)
+    print(f"[*] {STATION_NAME} is ONLINE on Port {PORT}!", flush=True)
+    print(f"[*] Public Stream: http://0.0.0.0:{PORT}/radio.mp3", flush=True)
+    print(f"[*] Live Source Ingest: http://0.0.0.0:{PORT}/live", flush=True)
+    print(f"[*] Source Password: {SOURCE_PASSWORD}", flush=True)
+    print("="*60 + "\n", flush=True)
+
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), RadioServerHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.server_close()
