@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Broadcaster Studio</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <script src="https://cdn.jsdelivr.net/npm/lamejs@1.2.1/lame.min.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #111; color: #fff; text-align: center; margin: 0; padding: 10px; }
+        .container { max-width: 600px; width: 100%; box-sizing: border-box; margin: 0 auto; background: #222; padding: 20px; border-radius: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); margin-top: 20px; }
+        @media (min-width: 768px) {
+            body { padding: 20px; }
+            .container { padding: 30px; margin-top: 50px; }
+        }
+        h2 { margin-top: 0; }
+        input[type="password"], input[type="number"] { width: 100%; padding: 15px; box-sizing: border-box; background: #333; border: 1px solid #444; color: white; border-radius: 8px; margin-bottom: 20px; font-size: 16px; }
+        button { background: #3b82f6; color: white; border: none; padding: 15px 30px; font-size: 18px; font-weight: bold; border-radius: 8px; cursor: pointer; width: 100%; transition: 0.2s; }
+        button:hover { background: #2563eb; }
+        .btn-danger { background: #4b5563; margin-top: 15px; font-size: 14px; padding: 10px; }
+        .btn-danger:hover { background: #dc2626; }
+        #mic-btn { background: #10b981; margin-top: 20px; height: 100px; border-radius: 50px; font-size: 24px; box-shadow: 0 0 20px rgba(16,185,129,0.3); }
+        #mic-btn.active { background: #ef4444; box-shadow: 0 0 30px rgba(239,68,68,0.5); animation: pulse 2s infinite; }
+        .btn-mute { background: #f59e0b; margin-top: 10px; font-size: 16px; padding: 12px; }
+        .btn-mute.muted { background: #6b7280; }
+        @keyframes pulse {
+            0% { box-shadow: 0 0 20px rgba(239,68,68,0.4); }
+            50% { box-shadow: 0 0 40px rgba(239,68,68,0.8); }
+            100% { box-shadow: 0 0 20px rgba(239,68,68,0.4); }
+        }
+        #vu-meter-container { height: 10px; background: #333; margin-top: 20px; border-radius: 5px; overflow: hidden; }
+        #vu-meter-fill { height: 100%; width: 0%; background: #10b981; transition: width 0.1s linear; }
+        .mixer-section { background: #1a1a1a; padding: 15px; border-radius: 8px; margin-top: 20px; border: 1px solid #333; text-align: left; }
+        .mixer-section h3 { margin-top: 0; font-size: 16px; color: #9ca3af; margin-bottom: 10px; text-align: center; }
+        input[type="file"] { margin-bottom: 10px; font-size: 14px; width: 100%; color: #ccc; }
+        audio { width: 100%; margin-top: 10px; border-radius: 8px; }
+        .vol-control { display: flex; align-items: center; justify-content: space-between; margin-top: 15px; }
+        .vol-control label { color: #ccc; font-size: 14px; width: 60px; font-weight: bold; }
+        .vol-control input[type="range"] { flex: 1; margin: 0 10px; }
+        .queue-list { list-style: none; padding: 0; margin-top: 15px; border-top: 1px solid #333; padding-top: 10px; max-height: 300px; overflow-y: auto; }
+        .queue-item { display: flex; justify-content: space-between; background: #222; padding: 15px; margin-bottom: 8px; border-radius: 8px; font-size: 15px; color: #ddd; align-items: center; transition: background 0.2s; flex-wrap: wrap; border: 1px solid #333; }
+        .queue-item:hover { background: #2a2a2a; }
+        .queue-item .track-info { width: 100%; display: flex; justify-content: space-between; margin-bottom: 10px; align-items: center; }
+        .queue-item .track-info span { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 10px; flex: 1; }
+        .queue-item .track-controls { width: 100%; display: flex; align-items: center; }
+        .queue-item .track-controls button { background: #3b82f6; padding: 10px 15px; border-radius: 6px; border: none; cursor: pointer; color: white; margin-right: 15px; min-width: 90px; font-weight: bold; font-size: 14px; }
+        .queue-item button.remove-btn { background: transparent; color: #ef4444; border: 1px solid #ef4444; padding: 6px 12px; font-size: 12px; border-radius: 4px; height: auto; cursor: pointer; font-weight: bold; }
+        .queue-item button.remove-btn:hover { background: #ef4444; color: #fff; }
+        .queue-item.playing { border-left: 4px solid #10b981; background: #1f2937; border-color: #10b981; }
+        #status-text { margin-top: 20px; font-size: 18px; color: #9ca3af; text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container" id="login-screen">
+        <h2>Studio Login</h2>
+        <input type="password" id="password" placeholder="Source Password" />
+        <div style="margin-bottom: 10px; text-align: left; color: #ccc;" id="captcha-question"></div>
+        <input type="number" id="captcha-answer" placeholder="Answer" />
+        <button onclick="login()">Enter Studio</button>
+    </div>
+    
+    <div class="container" id="studio-screen" style="display:none;">
+        <h2>Studio Control</h2>
+        <div id="status-text">Ready to Broadcast</div>
+        <button id="mic-btn" onclick="toggleBroadcast()">GO LIVE</button>
+        <button id="mute-btn" class="btn-mute" onclick="toggleMute()" style="display:none;">Mute Mic</button>
+        <div id="vu-meter-container">
+            <div id="vu-meter-fill"></div>
+        </div>
+        
+        <div class="mixer-section">
+            <h3>Mixer Levels</h3>
+            <div class="vol-control">
+                <label>Mic</label>
+                <input type="range" id="mic-vol" min="0" max="2" step="0.05" value="1" oninput="updateVolumes()" />
+            </div>
+            <div class="vol-control">
+                <label>Music</label>
+                <input type="range" id="music-vol" min="0" max="2" step="0.05" value="1" oninput="updateVolumes()" />
+            </div>
+        </div>
+
+        <div class="mixer-section">
+            <h3>Soundboard & Queue</h3>
+            <label style="color:#ccc; font-size:14px; display:block; margin-bottom:10px;">
+                <input type="checkbox" id="auto-advance" checked /> Auto-play next track when finished
+            </label>
+            <input type="file" id="local-file" accept="audio/*" onchange="addToQueue(event)" />
+            <div id="queue-list" class="queue-list"></div>
+        </div>
+        
+        <button class="btn-danger" onclick="logout()">Log Out</button>
+    </div>
+
+    <script>
+        let audioContext;
+        let mediaStream;
+        let processor;
+        let mp3Encoder;
+        let micGainNode;
+        let musicGainNode;
+        let isBroadcasting = false;
+        let isMicMuted = false;
+        let password = '';
+        let vuFill = document.getElementById('vu-meter-fill');
+        let statusText = document.getElementById('status-text');
+        let captchaExpected = 0;
+        let playlistQueue = [];
+
+        function updateVolumes() {
+            let micVol = parseFloat(document.getElementById('mic-vol').value);
+            let musicVol = parseFloat(document.getElementById('music-vol').value);
+            
+            if (micGainNode) {
+                micGainNode.gain.value = isMicMuted ? 0 : micVol;
+            }
+            if (musicGainNode) {
+                musicGainNode.gain.value = musicVol;
+            }
+        }
+
+        function addToQueue(event) {
+            let file = event.target.files[0];
+            if (!file) return;
+            
+            let url = URL.createObjectURL(file);
+            let id = Date.now();
+            let name = file.name;
+            
+            let audio = new Audio(url);
+            
+            let item = { id, url, name, audio, sourceNode: null, gainNode: null, rowElement: null };
+            playlistQueue.push(item);
+            
+            // Create DOM
+            let div = document.createElement('div');
+            div.className = 'queue-item';
+            div.id = 'track-' + id;
+            
+            div.innerHTML = `
+                <div class="track-info">
+                    <span>🎵 ${name}</span>
+                    <button class="remove-btn" onclick="removeTrack(${id})">X</button>
+                </div>
+                <div class="track-controls">
+                    <button id="play-btn-${id}" onclick="toggleTrack(${id})">▶ Play</button>
+                    <input type="range" min="0" max="2" step="0.05" value="1" oninput="changeTrackVol(${id}, this.value)" style="flex:1;">
+                </div>
+            `;
+            
+            document.getElementById('queue-list').appendChild(div);
+            item.rowElement = div;
+            
+            audio.onended = () => {
+                div.classList.remove('playing');
+                document.getElementById('play-btn-' + id).innerText = '▶ Play';
+                
+                if (document.getElementById('auto-advance').checked) {
+                    playNextAfter(id);
+                }
+            };
+            
+            event.target.value = '';
+            
+            // Wire it up if broadcasting
+            if (isBroadcasting) {
+                wireUpTrack(item);
+            }
+        }
+        
+        function wireUpTrack(item) {
+            if (item.sourceNode) return;
+            try {
+                item.sourceNode = audioContext.createMediaElementSource(item.audio);
+                item.gainNode = audioContext.createGain();
+                item.gainNode.gain.value = 1; // Default
+                item.sourceNode.connect(item.gainNode);
+                item.gainNode.connect(musicGainNode);
+            } catch(e) {
+                console.error("Error wiring track", e);
+            }
+        }
+        
+        function toggleTrack(id) {
+            let item = playlistQueue.find(t => t.id === id);
+            if (!item) return;
+            
+            let btn = document.getElementById('play-btn-' + id);
+            if (item.audio.paused) {
+                item.audio.play().catch(e => console.error(e));
+                btn.innerText = '⏸ Pause';
+                item.rowElement.classList.add('playing');
+                if (isBroadcasting) wireUpTrack(item);
+            } else {
+                item.audio.pause();
+                btn.innerText = '▶ Play';
+                item.rowElement.classList.remove('playing');
+            }
+        }
+        
+        function changeTrackVol(id, val) {
+            let item = playlistQueue.find(t => t.id === id);
+            if (!item) return;
+            if (item.gainNode) {
+                item.gainNode.gain.value = parseFloat(val);
+            }
+        }
+        
+        function removeTrack(id) {
+            let item = playlistQueue.find(t => t.id === id);
+            if (!item) return;
+            
+            item.audio.pause();
+            item.audio.src = '';
+            if (item.sourceNode) item.sourceNode.disconnect();
+            if (item.gainNode) item.gainNode.disconnect();
+            
+            item.rowElement.remove();
+            playlistQueue = playlistQueue.filter(t => t.id !== id);
+        }
+        
+        function playNextAfter(id) {
+            let index = playlistQueue.findIndex(t => t.id === id);
+            if (index !== -1 && index + 1 < playlistQueue.length) {
+                let nextItem = playlistQueue[index + 1];
+                toggleTrack(nextItem.id);
+            }
+        }
+
+        function toggleMute() {
+            isMicMuted = !isMicMuted;
+            let muteBtn = document.getElementById('mute-btn');
+            if (isMicMuted) {
+                if (micGainNode) micGainNode.gain.value = 0;
+                muteBtn.innerText = "Unmute Mic";
+                muteBtn.classList.add("muted");
+            } else {
+                let micVol = parseFloat(document.getElementById('mic-vol').value);
+                if (micGainNode) micGainNode.gain.value = micVol;
+                muteBtn.innerText = "Mute Mic";
+                muteBtn.classList.remove("muted");
+            }
+        }
+
+        function generateCaptcha() {
+            let a = Math.floor(Math.random() * 10) + 1;
+            let b = Math.floor(Math.random() * 10) + 1;
+            captchaExpected = a + b;
+            document.getElementById('captcha-question').innerText = `Human Check: What is ${a} + ${b}?`;
+            document.getElementById('captcha-answer').value = '';
+        }
+        generateCaptcha();
+
+        async function login() {
+            let ans = parseInt(document.getElementById('captcha-answer').value);
+            if (ans !== captchaExpected) {
+                alert("Incorrect captcha!");
+                generateCaptcha();
+                return;
+            }
+
+            password = document.getElementById('password').value;
+            // Test password
+            try {
+                let res = await fetch('/api/stream', {
+                    method: 'POST', 
+                    headers: {'Authorization': password},
+                    body: new Uint8Array(0)
+                });
+                if (!res.ok) { 
+                    alert('Invalid Password'); 
+                    generateCaptcha();
+                    return; 
+                }
+                
+                document.getElementById('login-screen').style.display = 'none';
+                document.getElementById('studio-screen').style.display = 'block';
+            } catch(e) {
+                alert('Connection error');
+            }
+        }
+
+        function logout() {
+            if (isBroadcasting) stopBroadcast();
+            password = '';
+            document.getElementById('password').value = '';
+            generateCaptcha();
+            document.getElementById('studio-screen').style.display = 'none';
+            document.getElementById('login-screen').style.display = 'block';
+        }
+
+        async function toggleBroadcast() {
+            if (isBroadcasting) {
+                stopBroadcast();
+            } else {
+                startBroadcast();
+            }
+        }
+
+        async function startBroadcast() {
+            try {
+                // Initialize Stereo MP3 Encoder to match Jingle (2 channels) to prevent browser decoder crashes
+                mp3Encoder = new lamejs.Mp3Encoder(2, 44100, 128); 
+                
+                mediaStream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        echoCancellation: true, 
+                        noiseSuppression: true, 
+                        autoGainControl: true 
+                    } 
+                });
+                
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 44100});
+                let source = audioContext.createMediaStreamSource(mediaStream);
+                
+                micGainNode = audioContext.createGain();
+                let micVol = parseFloat(document.getElementById('mic-vol').value);
+                micGainNode.gain.value = isMicMuted ? 0 : micVol;
+                source.connect(micGainNode);
+                
+                processor = audioContext.createScriptProcessor(4096, 1, 1);
+                
+                processor.onaudioprocess = function(e) {
+                    if (!isBroadcasting) return;
+                    let float32Array = e.inputBuffer.getChannelData(0);
+                    
+                    let sum = 0;
+                    let int16Array = new Int16Array(float32Array.length);
+                    for (let i = 0; i < float32Array.length; i++) {
+                        // +14dB digital gain
+                        let val = float32Array[i] * 5.0;
+                        if (val > 1.0) val = 1.0;
+                        if (val < -1.0) val = -1.0;
+                        
+                        sum += val * val;
+                        int16Array[i] = val < 0 ? val * 0x8000 : val * 0x7FFF;
+                    }
+                    
+                    let rms = Math.sqrt(sum / float32Array.length);
+                    vuFill.style.width = Math.min(100, rms * 500) + '%';
+                    
+                    // Pass int16Array twice (left and right) for dual-mono Stereo!
+                    let mp3buf = mp3Encoder.encodeBuffer(int16Array, int16Array);
+                    if (mp3buf.length > 0) {
+                        sendChunk(mp3buf);
+                    }
+                };
+                
+                let dummyGain = audioContext.createGain();
+                dummyGain.gain.value = 0; // MUTE local playback to prevent echo-cancellation
+                processor.connect(dummyGain);
+                dummyGain.connect(audioContext.destination);
+                
+                musicGainNode = audioContext.createGain();
+                let musicVol = parseFloat(document.getElementById('music-vol').value);
+                musicGainNode.gain.value = musicVol;
+                musicGainNode.connect(processor);
+                musicGainNode.connect(audioContext.destination);
+                
+                micGainNode.connect(processor);
+                
+                // Wire up all existing tracks
+                playlistQueue.forEach(item => {
+                    wireUpTrack(item);
+                });
+                
+                isBroadcasting = true;
+                let btn = document.getElementById('mic-btn');
+                btn.innerText = "ON AIR";
+                btn.className = "active";
+                statusText.innerText = "🔴 Broadcasting Live!";
+                statusText.style.color = "#ef4444";
+                document.getElementById('mute-btn').style.display = 'inline-block';
+                
+            } catch (e) {
+                alert("Microphone error: " + e.message);
+            }
+        }
+
+        function stopBroadcast() {
+            isBroadcasting = false;
+            
+            // Reset mute state
+            isMicMuted = false;
+            let muteBtn = document.getElementById('mute-btn');
+            muteBtn.style.display = 'none';
+            muteBtn.innerText = "Mute Mic";
+            muteBtn.classList.remove("muted");
+            
+            if (processor) processor.disconnect();
+            if (micGainNode) micGainNode.disconnect();
+            if (musicGainNode) musicGainNode.disconnect();
+            
+            // Disconnect all tracks
+            playlistQueue.forEach(item => {
+                if (item.sourceNode) { item.sourceNode.disconnect(); item.sourceNode = null; }
+                if (item.gainNode) { item.gainNode.disconnect(); item.gainNode = null; }
+            });
+            
+            if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
+            if (audioContext) audioContext.close();
+            
+            vuFill.style.width = '0%';
+            let btn = document.getElementById('mic-btn');
+            btn.innerText = "GO LIVE";
+            btn.className = "";
+            statusText.innerText = "Ready to Broadcast";
+            statusText.style.color = "#9ca3af";
+            
+            try {
+                let mp3buf = mp3Encoder.flush();
+                if (mp3buf.length > 0) {
+                    sendChunk(mp3buf);
+                }
+            } catch(e) {}
+            
+            fetch('/api/stop', {
+                method: 'POST',
+                headers: {'Authorization': password}
+            }).catch(console.error);
+        }
+
+        let chunkBuffer = [];
+        let chunkByteCount = 0;
+
+        function sendChunk(buf) {
+            let u8 = new Uint8Array(buf);
+            chunkBuffer.push(u8);
+            chunkByteCount += u8.length;
+            
+            // Send approximately 1 second of audio at a time (128kbps = 16KB/s)
+            if (chunkByteCount >= 16000) {
+                let merged = new Uint8Array(chunkByteCount);
+                let offset = 0;
+                for (let b of chunkBuffer) {
+                    merged.set(b, offset);
+                    offset += b.length;
+                }
+                chunkBuffer = [];
+                chunkByteCount = 0;
+                
+                fetch('/api/stream', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': password,
+                        'Content-Type': 'application/octet-stream'
+                    },
+                    body: merged
+                }).catch(e => console.log('Chunk error', e));
+            }
+        }
+    </script>
+</body>
+</html>
