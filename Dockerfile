@@ -9,6 +9,7 @@ RUN apt-get update && \
 WORKDIR /app
 
 COPY server.py /app/server.py
+COPY *.html /app/
 COPY audio /app/audio
 
 EXPOSE 8080
