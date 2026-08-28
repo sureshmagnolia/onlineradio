@@ -14,30 +14,6 @@ A 24/7 cloud internet radio server that supports **both live microphone broadcas
 
 ---
 
-## 🎙️ How to Broadcast Live
-
-### Option A: From your PC (using BUTT - Free)
-1. Download **[BUTT (Broadcast Using This Tool)](https://danielnoethen.de/butt/)**.
-2. Open BUTT $\rightarrow$ **Settings** $\rightarrow$ **Server Settings** $\rightarrow$ **Add**:
-   * **Server Type:** `Icecast`
-   * **Address:** `onlineradio.onrender.com` (or your Render domain)
-   * **Port:** `80` (or `443` if SSL)
-   * **Password:** `myradiopassword`
-   * **Mount:** `/live`
-   * **Audio format:** `MP3` (128 kbps)
-3. Click the **Play / Connect (▶)** button on BUTT and talk into your microphone!
-
-### Option B: From your Smartphone (Android / iPhone)
-1. Install **BroadcastMySelf** (Android) or **Larix Broadcaster** (iOS/Android).
-2. Configure Icecast Server:
-   * **Host:** `onlineradio.onrender.com`
-   * **Port:** `80`
-   * **Mount:** `/live`
-   * **Password:** `myradiopassword`
-3. Tap **Record / Live** to broadcast your voice from anywhere.
-
----
-
 ## 🎵 How to Add Recorded Songs / Programs
 
 1. Add your `.mp3` files into the `audio/` folder in this GitHub repository.
